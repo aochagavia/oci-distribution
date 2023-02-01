@@ -371,6 +371,25 @@ impl Client {
         })
     }
 
+    /// Blah
+    pub async fn push_blob(&mut self, image_ref: &Reference, data: &[u8], digest: &str) -> Result<()> {
+        match self
+            .push_blob_chunked(image_ref, data, digest)
+            .await
+        {
+            Err(OciDistributionError::SpecViolationError(violation)) => {
+                warn!(?violation, "Registry is not respecting the OCI Distribution Specification when doing chunked push operations");
+                warn!("Attempting monolithic push");
+                self.push_blob_monolithically(image_ref, data, digest)
+                    .await?;
+            }
+            Err(e) => return Err(e),
+            _ => {}
+        };
+
+        Ok(())
+    }
+
     /// Pushes a blob to the registry as a monolith
     ///
     /// Returns the pullable location of the blob
@@ -964,6 +983,70 @@ impl Client {
                 .await?,
             end_byte + 1,
         ))
+    }
+
+    /// Blah
+    pub async fn mount_blob(&self, image: &Reference, source: &Reference, digest: &str) -> Result<()> {
+        let base_url = self.to_v2_blob_upload_url(image);
+        let url = format!("{}?mount={}&from={}", base_url, digest, source.repository());
+
+        let res = RequestBuilderWrapper::from_client(self, |client| client.post(url.clone()))
+            .apply_auth(image, RegistryOperation::Push)?
+            .into_request_builder()
+            .send()
+            .await?;
+
+        self
+            .extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Blah
+    pub async fn push_raw_manifest(&self, image: &Reference, body: Vec<u8>) -> Result<String> {
+        let url = self.to_v2_manifest_url(image);
+
+        let mut headers = HeaderMap::new();
+        headers.insert("Content-Type", OCI_IMAGE_MEDIA_TYPE.parse().unwrap());
+
+        // Calculate the digest of the manifest, this is useful
+        // if the remote registry is violating the OCI Distribution Specification.
+        // See below for more details.
+        let manifest_hash = sha256_digest(&body);
+
+        debug!(?url, "push raw manifest");
+        let res = RequestBuilderWrapper::from_client(self, |client| client.put(url.clone()))
+            .apply_auth(image, RegistryOperation::Push)?
+            .into_request_builder()
+            .headers(headers)
+            .body(body)
+            .send()
+            .await?;
+
+        let ret = self
+            .extract_location_header(image, res, &reqwest::StatusCode::CREATED)
+            .await;
+
+        if matches!(ret, Err(OciDistributionError::RegistryNoLocationError)) {
+            // The registry is violating the OCI Distribution Spec, BUT the OCI
+            // image/artifact has been uploaded successfully.
+            // The `Location` header contains the sha256 digest of the manifest,
+            // we can reuse the value we calculated before.
+            // The workaround is there because repositories such as
+            // AWS ECR are violating this aspect of the spec. This at least let the
+            // oci-distribution users interact with these registries.
+            warn!("Registry is not respecting the OCI Distribution Specification: it didn't return the Location of the uploaded Manifest inside of the response headers. Working around this issue...");
+
+            let url_base = url
+                .strip_suffix(image.tag().unwrap_or("latest"))
+                .expect("The manifest URL always ends with the image tag suffix");
+            let url_by_digest = format!("{}{}", url_base, manifest_hash);
+
+            return Ok(url_by_digest);
+        }
+
+        ret
     }
 
     /// Pushes the manifest for a specified image
